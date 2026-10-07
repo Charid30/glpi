@@ -92,9 +92,9 @@ try {
 Write-Step 'Installation de GLPI Agent...'
 Write-Host "  [i]   Serveur : $GLPI_SERVER" -ForegroundColor DarkCyan
 Write-Host "  [i]   Mode    : Windows Service (EXECMODE=1)" -ForegroundColor DarkCyan
-Write-Host "  [i]   Modules : Tous (ADDLOCAL=ALL)" -ForegroundColor DarkCyan
+Write-Host "  [i]   Modules : Inventaire uniquement (ADDLOCAL=Inventory)" -ForegroundColor DarkCyan
 
-$msiArgs = "/i `"$MSI_TEMP`" /quiet /norestart SERVER=`"$GLPI_SERVER`" EXECMODE=1 ADDLOCAL=ALL"
+$msiArgs = "/i `"$MSI_TEMP`" /quiet /norestart SERVER=`"$GLPI_SERVER`" EXECMODE=1 ADDLOCAL=Inventory"
 
 try {
     $proc = Start-Process 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
@@ -152,19 +152,109 @@ try {
     Write-Warn "Impossible de supprimer le fichier temporaire : $MSI_TEMP"
 }
 
+# --- Etape 7 : Verification connectivite serveur GLPI -----------------------
+Write-Step "Test de connectivite vers le serveur GLPI (172.20.10.140)..."
+$serverOk = $false
+if (Test-Connection -ComputerName '172.20.10.140' -Count 2 -Quiet) {
+    Write-OK 'Serveur GLPI joignable (ping OK).'
+    $serverOk = $true
+} else {
+    Write-Err 'Serveur GLPI inaccessible. Le poste est peut-etre encore en quarantaine.'
+    Add-Content $LOG_FILE "[$(Get-Date -f 'HH:mm:ss')] ERR:  Serveur GLPI inaccessible"
+}
+
+# --- Etape 8 : Verification URL inventaire -----------------------------------
+if ($serverOk) {
+    Write-Step "Test de l URL d inventaire ($GLPI_SERVER)..."
+    try {
+        $resp = Invoke-WebRequest -Uri $GLPI_SERVER -UseBasicParsing -TimeoutSec 10
+        if ($resp.StatusCode -eq 200) {
+            Write-OK "URL inventaire accessible : $GLPI_SERVER"
+        } else {
+            Write-Warn "URL inventaire repond avec le code : $($resp.StatusCode)"
+        }
+    } catch {
+        Write-Err "URL inventaire inaccessible : $_"
+        Write-Warn "Verifiez que l URL contient bien 'front' et non 'font'."
+    }
+}
+
+# --- Etape 9 : Forcer l inventaire ------------------------------------------
+Write-Step "Forçage de l inventaire GLPI..."
+Start-Sleep -Seconds 2
+$inventoryOk = $false
+
+$bat = 'C:\Program Files\GLPI-Agent\glpi-agent.bat'
+if (Test-Path $bat) {
+    try {
+        $out = & cmd.exe /c "`"$bat`" --force" 2>&1
+        $out | ForEach-Object { Add-Content $LOG_FILE "[$(Get-Date -f 'HH:mm:ss')] AGENT: $_" }
+        Write-OK 'Inventaire force via glpi-agent.bat.'
+        $inventoryOk = $true
+    } catch {
+        Write-Warn "Erreur glpi-agent.bat : $_"
+    }
+} else {
+    try {
+        Invoke-WebRequest -Uri "$GLPI_LOCAL/?action=forceInventory" -UseBasicParsing -TimeoutSec 15 | Out-Null
+        Write-OK 'Inventaire force via interface locale.'
+        $inventoryOk = $true
+    } catch {
+        Write-Warn "Impossible de forcer l inventaire automatiquement."
+        Write-Warn "Ouvrez $GLPI_LOCAL et cliquez sur 'Force an Inventory'."
+    }
+}
+
+# --- Etape 10 : Verification remontee dans GLPI ------------------------------
+if ($inventoryOk -and $serverOk) {
+    Write-Step "Verification de la remontee dans GLPI (attente 30 secondes)..."
+    Start-Sleep -Seconds 30
+    try {
+        $glpiPage = Invoke-WebRequest -Uri "http://172.20.10.140" -UseBasicParsing -TimeoutSec 10
+        if ($glpiPage.StatusCode -eq 200) {
+            Write-OK "Interface GLPI accessible : http://172.20.10.140"
+            Write-Host "  [i]   Verifiez dans GLPI : Parc -> Ordinateurs -> $env:COMPUTERNAME" -ForegroundColor DarkCyan
+        }
+    } catch {
+        Write-Warn "Interface GLPI non accessible depuis ce poste."
+    }
+}
+
+# --- Verification URL registre -----------------------------------------------
+Write-Step 'Verification de l URL dans le registre Windows...'
+$regKey = 'HKLM:\SOFTWARE\GLPI-Agent'
+if (Test-Path $regKey) {
+    $regUrl = (Get-ItemProperty -Path $regKey -ErrorAction SilentlyContinue).server
+    if ($regUrl -like '*font/inventory*') {
+        Write-Err "URL incorrecte dans le registre : $regUrl"
+        Write-Step "Correction automatique de l URL..."
+        $fixedUrl = $regUrl -replace 'font/', 'front/'
+        Set-ItemProperty -Path $regKey -Name 'server' -Value $fixedUrl
+        Write-OK "URL corrigee : $fixedUrl"
+        Restart-Service 'GLPI-Agent' -ErrorAction SilentlyContinue
+        Write-OK 'Service redémarre avec la bonne URL.'
+    } elseif ($regUrl -like '*front/inventory*') {
+        Write-OK "URL du registre correcte : $regUrl"
+    }
+}
+
 # --- Resume ------------------------------------------------------------------
 Write-Host ""
 Write-Host "  +=====================================================+" -ForegroundColor Green
-Write-Host "  |   INSTALLATION TERMINEE AVEC SUCCES                |" -ForegroundColor Green
+Write-Host "  |   INSTALLATION TERMINEE                             |" -ForegroundColor Green
 Write-Host "  |   Poste  : $($env:COMPUTERNAME.PadRight(41))|" -ForegroundColor Green
 Write-Host "  |   Serveur: $('172.20.10.140'.PadRight(41))|" -ForegroundColor Green
 Write-Host "  |   Log    : $($LOG_FILE.Substring(0, [Math]::Min($LOG_FILE.Length,41)).PadRight(41))|" -ForegroundColor Green
 Write-Host "  +=====================================================+" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Prochaine etape : connectez-vous avec le compte AD de" -ForegroundColor DarkCyan
-Write-Host "  l utilisateur et forcez l inventaire via :" -ForegroundColor DarkCyan
-Write-Host "  $GLPI_LOCAL  ->  'Force an Inventory'" -ForegroundColor White
+if (-not $serverOk) {
+    Write-Host "  [!]   ATTENTION : serveur GLPI inaccessible." -ForegroundColor Yellow
+    Write-Host "        Verifiez la connexion reseau ou la quarantaine." -ForegroundColor Yellow
+    Write-Host ""
+}
+Write-Host "  Connectez-vous avec le compte AD de l utilisateur puis" -ForegroundColor DarkCyan
+Write-Host "  verifiez dans GLPI : Parc -> Ordinateurs -> $env:COMPUTERNAME" -ForegroundColor White
 Write-Host ""
 
-Add-Content $LOG_FILE "=== Installation terminee avec succes le $(Get-Date) ==="
+Add-Content $LOG_FILE "=== Installation terminee le $(Get-Date) ==="
 Add-Content $LOG_FILE ("=" * 60)
