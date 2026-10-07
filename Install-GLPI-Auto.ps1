@@ -66,27 +66,55 @@ function Start-GLPIInstall {
 
     # --- Etape 1 : Verifier si deja installe ---------------------------------
     Write-Step 'Verification installation existante...'
-    $installed = $null
-    try {
-        $installed = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                                   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-                     Get-ItemProperty -ErrorAction SilentlyContinue |
-                     Where-Object { $_.DisplayName -like '*GLPI*Agent*' }
-    } catch { }
 
-    if ($installed) {
-        Write-Warn "GLPI Agent deja installe : $($installed.DisplayName) $($installed.DisplayVersion)"
-        Write-Step 'Desinstallation de l ancienne version...'
+    function Get-GLPIEntries {
+        $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        $results = @()
+        foreach ($k in $keys) {
+            try {
+                $results += Get-ChildItem $k -ErrorAction SilentlyContinue |
+                            Get-ItemProperty -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DisplayName -like '*GLPI*' -or $_.DisplayName -like '*glpi*' }
+            } catch { }
+        }
+        return $results
+    }
+
+    function Remove-GLPIEntry ([object]$entry) {
+        $guid = $entry.PSChildName
+        Write-Warn "Desinstallation : $($entry.DisplayName) $($entry.DisplayVersion) [$guid]"
         try {
-            $proc = Start-Process 'msiexec.exe' -ArgumentList "/x `"$($installed.PSChildName)`" /quiet /norestart" -Wait -PassThru
+            $proc = Start-Process 'msiexec.exe' -ArgumentList "/x `"$guid`" /quiet /norestart" -Wait -PassThru
             if ($proc.ExitCode -eq 0) {
-                Write-OK 'Ancienne version desinstallee.'
+                Write-OK 'Desinstallation reussie.'
+                return $true
             } else {
-                Write-Warn "Desinstallation : code $($proc.ExitCode). On continue quand meme."
+                Write-Warn "Code retour desinstallation : $($proc.ExitCode)"
+                return $false
             }
         } catch {
-            Write-Warn "Impossible de desinstaller l ancienne version : $_"
+            Write-Warn "Erreur desinstallation : $_"
+            return $false
         }
+    }
+
+    $glpiEntries = Get-GLPIEntries
+    if ($glpiEntries) {
+        Write-Step "$($glpiEntries.Count) installation(s) GLPI trouvee(s). Desinstallation..."
+        foreach ($entry in $glpiEntries) { Remove-GLPIEntry $entry | Out-Null }
+        Start-Sleep -Seconds 3
+        # Verifier qu il ne reste rien
+        $remaining = Get-GLPIEntries
+        if ($remaining) {
+            Write-Warn "Certaines entrees GLPI persistent, on tente quand meme l installation."
+        } else {
+            Write-OK 'Toutes les installations GLPI precedentes supprimees.'
+        }
+    } else {
+        Write-OK 'Aucune installation GLPI existante detectee.'
     }
 
     # --- Etape 2 : Telecharger le MSI ----------------------------------------
@@ -129,6 +157,17 @@ function Start-GLPIInstall {
         } else {
             Write-Err "msiexec a retourne le code : $($proc.ExitCode)"
             Add-Content $LOG_FILE "=== ECHEC INSTALLATION : code $($proc.ExitCode) ==="
+            if ($proc.ExitCode -eq 1603) {
+                Write-Err "Code 1603 = une ancienne installation GLPI bloque la reinstallation."
+                Write-Warn "Solution : desinstallez manuellement via Panneau de configuration"
+                Write-Warn "           puis relancez ce script."
+            } elseif ($proc.ExitCode -eq 1618) {
+                Write-Err "Code 1618 = un autre installateur MSI est deja en cours."
+                Write-Warn "Solution : attendez la fin ou redemarrez le poste puis relancez."
+            } elseif ($proc.ExitCode -eq 1619) {
+                Write-Err "Code 1619 = fichier MSI introuvable ou corrompu."
+                Write-Warn "Solution : supprimez $MSI_TEMP et relancez le script."
+            }
         }
     } catch {
         Write-Err "Erreur lors de l installation : $_"
